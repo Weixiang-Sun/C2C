@@ -41,7 +41,7 @@ try:
 except ImportError:
     PEFT_AVAILABLE = False
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility"""
