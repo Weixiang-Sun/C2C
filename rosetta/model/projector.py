@@ -1023,6 +1023,108 @@ class C2CProjector(Projector):
 
         return output_key, output_value
 
+@register_model
+@capture_init_args
+class UniversalCacheProjector(Projector):
+    """
+    Encoder-decoder projector through a universal latent space Z.
+    - Encodes source KV (flattened heads) into universal dim Z via key_encoder/val_encoder
+    - Decodes Z into target space via key_decoder/val_decoder
+    - Residual addition with scalar gate (Gumbel-sigmoid during training)
+    - No target KV used in encoding (pure source → Z → target), unlike C2CProjector
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        universal_dim: int = 256,
+        hidden_dim: int = 512,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 1929,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+
+        in_dim = source_dim * source_num_heads
+        out_dim = target_dim * target_num_heads
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+
+        self.key_encoder = ModernMLP(in_dim, universal_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.val_encoder = ModernMLP(in_dim, universal_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.key_decoder = ModernMLP(universal_dim, out_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.val_decoder = ModernMLP(universal_dim, out_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+
+        self.key_gate = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.val_gate = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        sk, sv = source_kv  # (B, H_s, N, D_s)
+        tk, tv = target_kv  # (B, H_t, N, D_t)
+        B, Hs, N, Ds = sk.shape
+        _, Ht, _, Dt = tk.shape
+
+        # Flatten source heads: (B, N, H_s*D_s)
+        sk_flat = sk.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        sv_flat = sv.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+
+        # Encode → universal Z
+        Zk = self.key_encoder(sk_flat)  # (B, N, D_u)
+        Zv = self.val_encoder(sv_flat)
+
+        # Decode → target space
+        proj_k = self.key_decoder(Zk)   # (B, N, Ht*Dt)
+        proj_v = self.val_decoder(Zv)
+
+        # Reshape projections to (B, H_t, N, D_t)
+        proj_k = proj_k.view(B, N, Ht, Dt).transpose(1, 2)
+        proj_v = proj_v.view(B, N, Ht, Dt).transpose(1, 2)
+
+        # Gate: scalar Gumbel-sigmoid during training, hard threshold at inference
+        key_gate_logit = self.key_gate.view(1, 1, 1, 1)
+        val_gate_logit = self.val_gate.view(1, 1, 1, 1)
+        if self.training:
+            u1 = torch.rand(B, Ht, N, 1, device=key_gate_logit.device, dtype=key_gate_logit.dtype)
+            u2 = torch.rand(B, Ht, N, 1, device=val_gate_logit.device, dtype=val_gate_logit.dtype)
+            g1 = -torch.log(-torch.log(u1 + 1e-20) + 1e-20)
+            g2 = -torch.log(-torch.log(u2 + 1e-20) + 1e-20)
+            gate_k = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
+            gate_v = torch.sigmoid((val_gate_logit + g2) / self.gate_temperature)
+        else:
+            gate_k = (key_gate_logit > 0).float()
+            gate_v = (val_gate_logit > 0).float()
+
+        # Residual: target + gate * projection
+        out_k = tk + gate_k * proj_k
+        out_v = tv + gate_v * proj_v
+        return out_k, out_v
+
+
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)
 
