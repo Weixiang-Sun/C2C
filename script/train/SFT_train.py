@@ -540,7 +540,7 @@ def main():
             name=run_name,
             config=cfg,
             mode=output_config["wandb_config"]["mode"],
-            entity=output_config["wandb_config"]["entity"]
+            entity="wx-nd"
         )
     
     print(f"Outputs will be saved to: {timestamped_output_dir}")

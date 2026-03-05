@@ -584,6 +584,34 @@ class RosettaModel(nn.Module):
                                                                              
         return output
     
+    def _apply_iterative_projection(self, cache: DynamicCache, seq_len: int) -> DynamicCache:
+        """
+        Apply one additional round of projection using the current cache as both source and target.
+        Used for iterative cache reasoning (Idea 1): each round further refines the fused cache.
+        """
+        if self.base_model_idx not in self.projector_dict:
+            return cache
+
+        new_cache = clone_kv_cache(cache)
+
+        for source_model_idx, layer_map in self.projector_dict[self.base_model_idx].items():
+            for target_layer_idx, entry in layer_map.items():
+                for source_layer_idx, projector_idx in entry:
+                    source_key = cache.key_cache[source_layer_idx][:, :, :seq_len, :]
+                    source_value = cache.value_cache[source_layer_idx][:, :, :seq_len, :]
+                    target_key = cache.key_cache[target_layer_idx][:, :, :seq_len, :]
+                    target_value = cache.value_cache[target_layer_idx][:, :, :seq_len, :]
+
+                    proj_key, proj_value = self.projector_list[projector_idx].forward(
+                        (source_key, source_value),
+                        (target_key, target_value),
+                    )
+
+                    new_cache.key_cache[target_layer_idx][:, :, :seq_len, :] = proj_key
+                    new_cache.value_cache[target_layer_idx][:, :, :seq_len, :] = proj_value
+
+        return new_cache
+
     @torch.no_grad()
     def generate(
         self,
@@ -607,6 +635,7 @@ class RosettaModel(nn.Module):
         max_length: Optional[int] = None,
         use_cache: bool = True,
         streamer = None,
+        iterative_rounds: int = 1,
         *args,
         **kwargs,
     ):
@@ -615,6 +644,11 @@ class RosettaModel(nn.Module):
         - Uses this module's forward for prefill and per-token decode.
         - Samples tokens via rosetta.model.sampling.sample_token.
         Returns a tensor of shape [batch, prompt_len + generated_len] for the base model stream.
+
+        iterative_rounds: int, number of projection rounds to apply after prefill (default=1).
+            Round 1 is the standard C2C fusion during prefill.
+            Rounds 2..K apply _apply_iterative_projection, using the current fused cache as
+            both source and target for further self-refinement (Idea 1: iterative cache reasoning).
         """
 
         self.kv_cache_dict = dict()
@@ -675,6 +709,13 @@ class RosettaModel(nn.Module):
         )
 
         current_past = prefill_output.past_key_values
+
+        # Iterative cache reasoning: apply projector additional rounds after initial prefill fusion
+        # Round 1 is already done during prefill (standard C2C). Rounds 2..K use current fused cache
+        # as both source and target for further self-refinement.
+        for _ in range(iterative_rounds - 1):
+            current_past = self._apply_iterative_projection(current_past, seq_len=prompt_len)
+
         all_input_ids = base_input_ids
         current_attention_mask = base_attention_mask
 
