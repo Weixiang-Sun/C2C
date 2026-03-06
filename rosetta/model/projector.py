@@ -1125,6 +1125,139 @@ class UniversalCacheProjector(Projector):
         return out_k, out_v
 
 
+@register_model
+@capture_init_args
+class BidirectionalUniversalProjector(Projector):
+    """
+    Bidirectional universal cache projector with source-only encoders and
+    target-conditioned decoders. Supports 4 directions: A2B, B2A, A2A, B2B.
+    Shared decoders force encoder Z-space alignment across models.
+
+    A = source/teacher (e.g., Qwen2.5-0.5B), B = target/base (e.g., Qwen3-0.6B).
+    Default direction="A2B" for inference compatibility with RosettaModel.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        universal_dim: int = 256,
+        hidden_dim: int = 512,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 1929,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+
+        dim_A = source_dim * source_num_heads
+        dim_B = target_dim * target_num_heads
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.dim_A = dim_A
+        self.dim_B = dim_B
+
+        # Source-only encoders (universal, no target conditioning)
+        self.key_encoder_A = ModernMLP(dim_A, universal_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.val_encoder_A = ModernMLP(dim_A, universal_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.key_encoder_B = ModernMLP(dim_B, universal_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.val_encoder_B = ModernMLP(dim_B, universal_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+
+        # Target-conditioned decoders: concat(Z, target_flat) -> residual
+        self.key_decoder_A = ModernMLP(universal_dim + dim_A, dim_A, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.val_decoder_A = ModernMLP(universal_dim + dim_A, dim_A, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.key_decoder_B = ModernMLP(universal_dim + dim_B, dim_B, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+        self.val_decoder_B = ModernMLP(universal_dim + dim_B, dim_B, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout, use_swiglu=True, dtype=dtype)
+
+        # Per-target-side scalar gates
+        self.gate_A_key = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.gate_A_val = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.gate_B_key = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.gate_B_val = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def _gumbel_gate(self, logit: Tensor, shape, device, dtype) -> Tensor:
+        logit = logit.view(1, 1, 1, 1)
+        if self.training:
+            u = torch.rand(shape, device=device, dtype=dtype)
+            g = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            return torch.sigmoid((logit + g) / self.gate_temperature)
+        else:
+            return (logit > 0).float()
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+        direction: str = "A2B",
+    ) -> Tuple[Tensor, Tensor]:
+        sk, sv = source_kv  # (B, H_src, N, D_src)
+        tk, tv = target_kv  # (B, H_tgt, N, D_tgt)
+        B_s, Hs, N, Ds = sk.shape
+        B_t, Ht, _, Dt = tk.shape
+
+        # Flatten heads
+        sk_flat = sk.transpose(1, 2).contiguous().view(B_s, N, Hs * Ds)
+        sv_flat = sv.transpose(1, 2).contiguous().view(B_s, N, Hs * Ds)
+        tk_flat = tk.transpose(1, 2).contiguous().view(B_t, N, Ht * Dt)
+        tv_flat = tv.transpose(1, 2).contiguous().view(B_t, N, Ht * Dt)
+
+        # Select encoder by source side
+        if direction in ("A2B", "A2A"):
+            Zk = self.key_encoder_A(sk_flat)
+            Zv = self.val_encoder_A(sv_flat)
+        else:  # B2A, B2B
+            Zk = self.key_encoder_B(sk_flat)
+            Zv = self.val_encoder_B(sv_flat)
+
+        # Select decoder + gate by target side
+        if direction in ("A2B", "B2B"):
+            # Target is B
+            dec_k_input = torch.cat([Zk, tk_flat], dim=-1)
+            dec_v_input = torch.cat([Zv, tv_flat], dim=-1)
+            residual_k = self.key_decoder_B(dec_k_input)
+            residual_v = self.val_decoder_B(dec_v_input)
+            # Reshape to target shape
+            residual_k = residual_k.view(B_t, N, Ht, Dt).transpose(1, 2)
+            residual_v = residual_v.view(B_t, N, Ht, Dt).transpose(1, 2)
+            gate_shape = (B_t, Ht, N, 1)
+            gate_k = self._gumbel_gate(self.gate_B_key, gate_shape, tk.device, tk.dtype)
+            gate_v = self._gumbel_gate(self.gate_B_val, gate_shape, tk.device, tk.dtype)
+        else:
+            # Target is A (B2A or A2A)
+            dec_k_input = torch.cat([Zk, tk_flat], dim=-1)
+            dec_v_input = torch.cat([Zv, tv_flat], dim=-1)
+            residual_k = self.key_decoder_A(dec_k_input)
+            residual_v = self.val_decoder_A(dec_v_input)
+            residual_k = residual_k.view(B_t, N, Ht, Dt).transpose(1, 2)
+            residual_v = residual_v.view(B_t, N, Ht, Dt).transpose(1, 2)
+            gate_shape = (B_t, Ht, N, 1)
+            gate_k = self._gumbel_gate(self.gate_A_key, gate_shape, tk.device, tk.dtype)
+            gate_v = self._gumbel_gate(self.gate_A_val, gate_shape, tk.device, tk.dtype)
+
+        out_k = tk + gate_k * residual_k
+        out_v = tv + gate_v * residual_v
+        return out_k, out_v
+
+
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)
 
