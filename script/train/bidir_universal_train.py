@@ -271,33 +271,53 @@ def build_fused_cache_and_hooks(
     return hook_handlers, fused_kv
 
 
-def build_mapping_with_projector_idx(
+def build_all_direction_mappings(
     forward_mapping: Dict[int, List[int]],
-) -> Tuple[Dict[int, List[Tuple[int, int]]], Dict[int, List[Tuple[int, int]]]]:
+    num_A_layers: int,
+    num_B_layers: int,
+) -> Tuple[
+    Dict[int, List[Tuple[int, int]]],  # A2B
+    Dict[int, List[Tuple[int, int]]],  # B2A
+    Dict[int, List[Tuple[int, int]]],  # AA
+    Dict[int, List[Tuple[int, int]]],  # BB
+]:
     """
-    Build explicit (source_layer, projector_idx) mappings for both directions.
+    Build explicit (source_layer, projector_idx) mappings for all 4 directions.
 
     Forward mapping input: {B_layer: [A_layer, ...]}  (from last_aligned_sources)
     Projectors are indexed by B_layer.
 
-    Returns:
-        forward_with_idx: {B_layer: [(A_layer, projector_idx=B_layer), ...]}
-            Used for A2B and B2B paths (target=B)
-        reverse_with_idx: {A_layer: [(B_layer, projector_idx=B_layer), ...]}
-            Used for B2A and A2A paths (target=A)
+    Returns 4 mappings, each: {target_layer: [(source_layer, projector_idx), ...]}
+        a2b_mapping: target=B, source=A  (cross-model)
+        b2a_mapping: target=A, source=B  (cross-model)
+        aa_mapping:  target=A, source=A  (reconstruction, source_layer=target_layer)
+        bb_mapping:  target=B, source=B  (reconstruction, source_layer=target_layer)
     """
-    forward_with_idx: Dict[int, List[Tuple[int, int]]] = {}
-    reverse_with_idx: Dict[int, List[Tuple[int, int]]] = {}
-
+    # A2B: target=B[b], source=A[a], projector=b
+    a2b_mapping: Dict[int, List[Tuple[int, int]]] = {}
     for b_layer, a_layers in forward_mapping.items():
-        projector_idx = b_layer  # projectors are indexed by B layer
-        forward_with_idx[b_layer] = [(a_layer, projector_idx) for a_layer in a_layers]
-        for a_layer in a_layers:
-            if a_layer not in reverse_with_idx:
-                reverse_with_idx[a_layer] = []
-            reverse_with_idx[a_layer].append((b_layer, projector_idx))
+        a2b_mapping[b_layer] = [(a_layer, b_layer) for a_layer in a_layers]
 
-    return forward_with_idx, reverse_with_idx
+    # B2A: target=A[a], source=B[b], projector=b
+    b2a_mapping: Dict[int, List[Tuple[int, int]]] = {}
+    for b_layer, a_layers in forward_mapping.items():
+        for a_layer in a_layers:
+            if a_layer not in b2a_mapping:
+                b2a_mapping[a_layer] = []
+            b2a_mapping[a_layer].append((b_layer, b_layer))
+
+    # AA: target=A[a], source=A[a] (self), projector=first associated B layer
+    aa_mapping: Dict[int, List[Tuple[int, int]]] = {}
+    for a_layer, pairs in b2a_mapping.items():
+        # Use first associated projector; source is same A layer (self-reconstruction)
+        aa_mapping[a_layer] = [(a_layer, pairs[0][1])]
+
+    # BB: target=B[b], source=B[b] (self), projector=b
+    bb_mapping: Dict[int, List[Tuple[int, int]]] = {}
+    for b_layer in range(num_B_layers):
+        bb_mapping[b_layer] = [(b_layer, b_layer)]
+
+    return a2b_mapping, b2a_mapping, aa_mapping, bb_mapping
 
 
 def main():
@@ -401,12 +421,15 @@ def main():
     # Layer mappings
     # Raw mapping: B_layer -> [A_layer] (from last_aligned_sources)
     raw_mapping = last_aligned_sources(num_layers_B, num_layers_A, k=1)
-    # Build explicit (source_layer, projector_idx) mappings for both directions
-    forward_mapping, reverse_mapping = build_mapping_with_projector_idx(raw_mapping)
+    # Build explicit (source_layer, projector_idx) mappings for all 4 directions
+    a2b_mapping, b2a_mapping, aa_mapping, bb_mapping = build_all_direction_mappings(
+        raw_mapping, num_layers_A, num_layers_B
+    )
 
     if is_main_process:
-        print(f"Forward mapping (B_layer -> [(A_layer, proj_idx)]): {forward_mapping}")
-        print(f"Reverse mapping (A_layer -> [(B_layer, proj_idx)]): {reverse_mapping}")
+        print(f"A2B mapping (B_layer -> [(A_layer, proj)]): {a2b_mapping}")
+        print(f"B2A mapping (A_layer -> [(B_layer, proj)]): {b2a_mapping}")
+        print(f"AA mapping entries: {len(aa_mapping)}, BB mapping entries: {len(bb_mapping)}")
 
     # Loss weights
     loss_weights = model_config.get("loss_weights", {"AB": 1.0, "BA": 0.5, "AA": 0.3, "BB": 0.3})
@@ -528,7 +551,7 @@ def main():
                 loss = bidir_train_step(
                     batch, model_A, model_B, projectors_ref,
                     tokenizer_A, tokenizer_B,
-                    forward_mapping, reverse_mapping,
+                    a2b_mapping, b2a_mapping, aa_mapping, bb_mapping,
                     loss_weights, total_weight,
                     device, training_config.get("max_length", 2048),
                 )
@@ -591,7 +614,7 @@ def main():
                             "1": {}  # source_model_idx (teacher=A)
                         }
                     }
-                    for tgt_layer, src_proj_pairs in forward_mapping.items():
+                    for tgt_layer, src_proj_pairs in a2b_mapping.items():
                         src_layer, proj_idx = src_proj_pairs[0]
                         projector_config_dict["0"]["1"][str(tgt_layer)] = [
                             [src_layer, proj_idx]
@@ -633,8 +656,10 @@ def bidir_train_step(
     projectors: nn.ModuleList,  # indexed by B layer
     tokenizer_A,
     tokenizer_B,
-    forward_mapping: Dict[int, List[Tuple[int, int]]],  # B_layer -> [(A_layer, proj_idx)]
-    reverse_mapping: Dict[int, List[Tuple[int, int]]],  # A_layer -> [(B_layer, proj_idx)]
+    a2b_mapping: Dict[int, List[Tuple[int, int]]],  # B_layer -> [(A_layer, proj_idx)]
+    b2a_mapping: Dict[int, List[Tuple[int, int]]],  # A_layer -> [(B_layer, proj_idx)]
+    aa_mapping: Dict[int, List[Tuple[int, int]]],   # A_layer -> [(A_layer, proj_idx)]
+    bb_mapping: Dict[int, List[Tuple[int, int]]],   # B_layer -> [(B_layer, proj_idx)]
     loss_weights: Dict[str, float],
     total_weight: float,
     device: str,
@@ -720,16 +745,16 @@ def bidir_train_step(
     paths = []
     if loss_weights.get("AB", 0) > 0:
         paths.append(("A2B", KV_A, KV_B, model_B, resp_ids_B, resp_mask_B, labels_B_full[:, instr_len:],
-                       forward_mapping, loss_weights["AB"]))
+                       a2b_mapping, loss_weights["AB"]))
     if loss_weights.get("BA", 0) > 0:
         paths.append(("B2A", KV_B, KV_A, model_A, resp_ids_A, resp_mask_A, labels_A_full[:, instr_len_A:],
-                       reverse_mapping, loss_weights["BA"]))
+                       b2a_mapping, loss_weights["BA"]))
     if loss_weights.get("AA", 0) > 0:
         paths.append(("A2A", KV_A, KV_A, model_A, resp_ids_A, resp_mask_A, labels_A_full[:, instr_len_A:],
-                       reverse_mapping, loss_weights["AA"]))
+                       aa_mapping, loss_weights["AA"]))
     if loss_weights.get("BB", 0) > 0:
         paths.append(("B2B", KV_B, KV_B, model_B, resp_ids_B, resp_mask_B, labels_B_full[:, instr_len:],
-                       forward_mapping, loss_weights["BB"]))
+                       bb_mapping, loss_weights["BB"]))
 
     for direction, src_kv, tgt_kv, target_model, resp_ids, resp_mask, resp_labels, mapping, weight in paths:
         if resp_ids.shape[1] == 0:
